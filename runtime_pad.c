@@ -1,0 +1,568 @@
+/* libScePad on SDL3 gamepads, with a keyboard fallback. SDL events are pumped
+ * by the window thread (gpu/shim/window.cpp); here state is only sampled.
+ *
+ * Keyboard layout (when no gamepad is connected):
+ *   WASD left stick, arrow keys right stick, Space Cross, LShift Circle,
+ *   E Square, Q Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, C R3,
+ *   Enter Options, Tab left touchpad, Backspace right touchpad,
+ *   IJKL d-pad (I up, K down, J left, L right). */
+#define _GNU_SOURCE
+#include "runtime.h"
+#include "gpu/bbgpu.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <time.h>
+#include <SDL3/SDL.h>
+#include <sys/stat.h>
+
+#define ERR_INVALID_ARG ((int32_t)0x80920001)
+#define ERR_INVALID_HANDLE ((int32_t)0x80920003)
+#define ERR_ALREADY_OPENED ((int32_t)0x80920004)
+#define ERR_NOT_INITIALIZED ((int32_t)0x80920005)
+#define PAD_HANDLE 1
+
+enum {
+    BTN_L3=0x2, BTN_R3=0x4, BTN_OPTIONS=0x8, BTN_UP=0x10, BTN_RIGHT=0x20, BTN_DOWN=0x40, BTN_LEFT=0x80,
+    BTN_L2=0x100, BTN_R2=0x200, BTN_L1=0x400, BTN_R1=0x800, BTN_TRIANGLE=0x1000, BTN_CIRCLE=0x2000,
+    BTN_CROSS=0x4000, BTN_SQUARE=0x8000, BTN_TOUCHPAD=0x100000,
+};
+typedef struct { uint16_t x, y; uint8_t id, reserve[3]; } PadTouch;
+typedef struct {
+    uint32_t buttons;
+    uint8_t left_x, left_y, right_x, right_y;
+    uint8_t l2, r2, analog_padding[2];
+    float orientation[4], acceleration[3], angular_velocity[3];
+    uint8_t touch_count, touch_reserve[3];
+    uint32_t touch_held_time;
+    PadTouch touches[2];
+    uint8_t connected, pad0[3];
+    uint64_t timestamp;
+    uint8_t extension[16];
+    uint8_t connected_count, reserve[2], unique_length, unique[12];
+} PadData;
+typedef struct {
+    float pixel_density; uint16_t resolution_x, resolution_y;
+    uint8_t dead_zone_left, dead_zone_right, connection_type, connected_count;
+    uint8_t connected, pad[3];
+    int32_t device_class;
+    uint8_t reserve[8];
+} ControllerInfo;
+_Static_assert(sizeof(PadData)==120,"OrbisPadData layout");
+_Static_assert(sizeof(PadTouch)==8,"OrbisPadTouch layout");
+_Static_assert(__builtin_offsetof(PadData,touches)==60,"OrbisPadData touch offset");
+_Static_assert(__builtin_offsetof(PadData,timestamp)==80,"OrbisPadData timestamp offset");
+_Static_assert(sizeof(ControllerInfo)==28,"OrbisPadControllerInformation layout");
+
+static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+static int initialized, opened, sdl_ready;
+static SDL_Gamepad *gamepad;
+static size_t reads;
+static uint8_t connected_count;
+
+static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
+static uint8_t axis(int16_t v) { int x=(v+32768)>>8; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
+static uint8_t trigger(int16_t v) { int x=v>>7; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
+static uint16_t touch_axis(float v, int max) {
+    return (uint16_t)(v<=0.0f ? 0 : v>=1.0f ? max : (int)(v*max+0.5f));
+}
+static void touch_click(PadData *d, int right) {
+    d->buttons|=BTN_TOUCHPAD;
+    d->touch_count=1;
+    d->touches[0]=(PadTouch){.x=right ? 1440 : 480,.y=471,.id=0};
+}
+
+/* Opens the first gamepad SDL knows about; called under lock. */
+static SDL_Gamepad *current_gamepad(void) {
+    if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
+    if (sdl_ready<0) return NULL;
+    if (gamepad && !SDL_GamepadConnected(gamepad)) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
+    if (!gamepad) {
+        int count=0;
+        SDL_JoystickID *ids=SDL_GetGamepads(&count);
+        if (ids && count>0) {
+            gamepad=SDL_OpenGamepad(ids[0]);
+            if (gamepad) { ++connected_count; printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(gamepad)); }
+        }
+        SDL_free(ids);
+    }
+    return gamepad;
+}
+typedef struct {
+    const char *name;
+    SDL_GamepadButton sdl;
+    uint32_t ps;      /* gameplay profile */
+    uint32_t ps_menu; /* menu profile */
+    int menu_set;     /* [menu] section set this input explicitly */
+} ControllerButtonMapping;
+
+#define CM(n,s,b) {n,s,b,b,0}
+static ControllerButtonMapping controller_button_map[] = {
+    CM("south", SDL_GAMEPAD_BUTTON_SOUTH, BTN_CROSS),
+    CM("east", SDL_GAMEPAD_BUTTON_EAST, BTN_CIRCLE),
+    CM("west", SDL_GAMEPAD_BUTTON_WEST, BTN_SQUARE),
+    CM("north", SDL_GAMEPAD_BUTTON_NORTH, BTN_TRIANGLE),
+    CM("leftshoulder", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, BTN_L1),
+    CM("rightshoulder", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, BTN_R1),
+    CM("leftstick", SDL_GAMEPAD_BUTTON_LEFT_STICK, BTN_L3),
+    CM("rightstick", SDL_GAMEPAD_BUTTON_RIGHT_STICK, BTN_R3),
+    CM("start", SDL_GAMEPAD_BUTTON_START, BTN_OPTIONS),
+    CM("back", SDL_GAMEPAD_BUTTON_BACK, BTN_TOUCHPAD),
+    CM("touchpad", SDL_GAMEPAD_BUTTON_TOUCHPAD, BTN_TOUCHPAD),
+    CM("dpad_up", SDL_GAMEPAD_BUTTON_DPAD_UP, BTN_UP),
+    CM("dpad_down", SDL_GAMEPAD_BUTTON_DPAD_DOWN, BTN_DOWN),
+    CM("dpad_left", SDL_GAMEPAD_BUTTON_DPAD_LEFT, BTN_LEFT),
+    CM("dpad_right", SDL_GAMEPAD_BUTTON_DPAD_RIGHT, BTN_RIGHT),
+};
+#define CONTROLLER_BUTTON_COUNT (sizeof(controller_button_map) / sizeof(*controller_button_map))
+
+/* Triggers have a gameplay and a menu action each. */
+static uint32_t left_trigger_action = BTN_L2, left_trigger_menu = BTN_L2;
+static uint32_t right_trigger_action = BTN_R2, right_trigger_menu = BTN_R2;
+static int left_trigger_menu_set, right_trigger_menu_set;
+static int controller_remap_loaded;
+
+/* Menu/gameplay switching. The pad layer cannot see the game's own state, so the profile
+ * is switched by the player: a button chord (menu_toggle=a+b), the F10 key, and optionally
+ * automatically whenever the input mapped to Options is pressed (auto_menu=on). */
+#define CHORD_MAX 4
+static struct { int count; int idx[CHORD_MAX]; int lt, rt; } menu_chord; /* idx: button map index */
+static int auto_menu;
+static int menu_mode; /* 0 gameplay, 1 menu */
+
+static uint32_t controller_action(const char *name) {
+    static const struct {
+        const char *name;
+        uint32_t bit;
+    } actions[] = {
+        {"cross", BTN_CROSS}, {"circle", BTN_CIRCLE},
+        {"square", BTN_SQUARE}, {"triangle", BTN_TRIANGLE},
+        {"l1", BTN_L1}, {"r1", BTN_R1},
+        {"l2", BTN_L2}, {"r2", BTN_R2},
+        {"l3", BTN_L3}, {"r3", BTN_R3},
+        {"options", BTN_OPTIONS}, {"touchpad", BTN_TOUCHPAD},
+        {"up", BTN_UP}, {"down", BTN_DOWN},
+        {"left", BTN_LEFT}, {"right", BTN_RIGHT},
+        {"none", 0},
+    };
+
+    for (size_t i = 0; i < sizeof(actions) / sizeof(*actions); ++i) {
+        if (!strcmp(name, actions[i].name)) return actions[i].bit;
+    }
+    return 0xffffffffu;
+}
+
+static char *trim_controller_token(char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') ++s;
+    size_t n = strlen(s);
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' ||
+                 s[n - 1] == '\r' || s[n - 1] == '\n')) {
+        s[--n] = '\0';
+    }
+    return s;
+}
+
+static void parse_menu_chord(char *value) {
+    memset(&menu_chord, 0, sizeof(menu_chord));
+    for (char *tok = strtok(value, "+"); tok; tok = strtok(NULL, "+")) {
+        tok = trim_controller_token(tok);
+        if (!strcmp(tok, "lefttrigger")) { menu_chord.lt = 1; continue; }
+        if (!strcmp(tok, "righttrigger")) { menu_chord.rt = 1; continue; }
+        for (size_t i = 0; i < CONTROLLER_BUTTON_COUNT; ++i) {
+            if (!strcmp(tok, controller_button_map[i].name) && menu_chord.count < CHORD_MAX) {
+                menu_chord.idx[menu_chord.count++] = (int)i;
+                break;
+            }
+        }
+    }
+}
+
+enum { SEC_GAMEPLAY, SEC_MENU, SEC_SETTINGS };
+
+static void load_controller_remap(void) {
+    if (controller_remap_loaded) return;
+    controller_remap_loaded = 1;
+
+    const char *path = getenv("BB_CONTROLLER_REMAP");
+    if (!path || !*path) path = "controller-remap.ini";
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[128];
+    int section = SEC_GAMEPLAY; /* keys before any [section] are gameplay (old INI files) */
+
+    while (fgets(line, sizeof(line), f)) {
+        char *comment = strchr(line, '#');
+        if (comment) *comment = '\0';
+
+        char *head = trim_controller_token(line);
+        if (*head == '[') {
+            char *close = strchr(head, ']');
+            if (close) *close = '\0';
+            const char *name = head + 1;
+            if (!strcmp(name, "menu")) section = SEC_MENU;
+            else if (!strcmp(name, "settings")) section = SEC_SETTINGS;
+            else section = SEC_GAMEPLAY; /* [gameplay] and anything unknown */
+            continue;
+        }
+
+        char *equals = strchr(line, '=');
+        if (!equals) continue;
+
+        *equals = '\0';
+        char *input = trim_controller_token(line);
+        char *output = trim_controller_token(equals + 1);
+
+        if (!*input || !*output) continue;
+
+        if (section == SEC_SETTINGS) {
+            if (!strcmp(input, "menu_toggle")) parse_menu_chord(output);
+            else if (!strcmp(input, "auto_menu")) auto_menu = !strcmp(output, "on") || !strcmp(output, "1");
+            continue;
+        }
+
+        uint32_t action = controller_action(output);
+        if (action == 0xffffffffu) continue;
+        const int menu = section == SEC_MENU;
+
+        if (!strcmp(input, "lefttrigger")) {
+            if (menu) { left_trigger_menu = action; left_trigger_menu_set = 1; }
+            else left_trigger_action = action;
+            continue;
+        }
+
+        if (!strcmp(input, "righttrigger")) {
+            if (menu) { right_trigger_menu = action; right_trigger_menu_set = 1; }
+            else right_trigger_action = action;
+            continue;
+        }
+
+        for (size_t i = 0; i < CONTROLLER_BUTTON_COUNT; ++i) {
+            if (!strcmp(input, controller_button_map[i].name)) {
+                if (menu) { controller_button_map[i].ps_menu = action; controller_button_map[i].menu_set = 1; }
+                else controller_button_map[i].ps = action;
+                break;
+            }
+        }
+    }
+
+    fclose(f);
+
+    /* Inputs the [menu] section does not mention follow the gameplay profile. */
+    for (size_t i = 0; i < CONTROLLER_BUTTON_COUNT; ++i)
+        if (!controller_button_map[i].menu_set) controller_button_map[i].ps_menu = controller_button_map[i].ps;
+    if (!left_trigger_menu_set) left_trigger_menu = left_trigger_action;
+    if (!right_trigger_menu_set) right_trigger_menu = right_trigger_action;
+
+    printf("Runtime: controller remap loaded from %s (auto_menu=%s, toggle chord of %d buttons)\n",
+           path, auto_menu ? "on" : "off", menu_chord.count + menu_chord.lt + menu_chord.rt);
+}
+
+static void set_menu_mode(int mode) {
+    if (mode == menu_mode) return;
+    menu_mode = mode;
+    printf("Runtime: controller profile -> %s\n", menu_mode ? "menu" : "gameplay");
+}
+
+/* Called once per sample with the physical state; flips the profile on the configured triggers. */
+static void update_menu_mode(SDL_Gamepad *g, const bool *k, uint8_t raw_l2, uint8_t raw_r2) {
+    static int chord_was_down, f10_was_down;
+    static bool prev[sizeof(controller_button_map) / sizeof(*controller_button_map)];
+
+    int flip = 0;
+    for (size_t i = 0; i < CONTROLLER_BUTTON_COUNT; ++i) {
+        const bool down = SDL_GetGamepadButton(g, controller_button_map[i].sdl);
+        const uint32_t active = menu_mode ? controller_button_map[i].ps_menu : controller_button_map[i].ps;
+        if (auto_menu && down && !prev[i] && active == BTN_OPTIONS) flip = 1;
+        prev[i] = down;
+    }
+
+    int total = menu_chord.count + menu_chord.lt + menu_chord.rt;
+    int chord_down = total > 0;
+    for (int c = 0; c < menu_chord.count && chord_down; ++c)
+        if (!SDL_GetGamepadButton(g, controller_button_map[menu_chord.idx[c]].sdl)) chord_down = 0;
+    if (chord_down && menu_chord.lt && raw_l2 <= 30) chord_down = 0;
+    if (chord_down && menu_chord.rt && raw_r2 <= 30) chord_down = 0;
+    if (chord_down && !chord_was_down) flip = 1;
+    chord_was_down = chord_down;
+
+    const int f10 = k && k[SDL_SCANCODE_F10];
+    if (f10 && !f10_was_down) flip = 1;
+    f10_was_down = f10;
+
+    if (flip) set_menu_mode(!menu_mode);
+}
+
+static void sample_host(PadData *d) {
+    memset(d,0,sizeof(*d));
+    d->left_x=d->left_y=d->right_x=d->right_y=128;
+    d->orientation[3]=1.0f;
+    d->connected=1; d->connected_count=connected_count ? connected_count : 1;
+    d->timestamp=now_us();
+    SDL_Gamepad *g=current_gamepad();
+    if (bbgpu_overlay_captures_input()) return; /* settings menu open: neutral input */
+    const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
+    if (g) {
+        load_controller_remap();
+        const uint8_t raw_l2 = trigger(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
+        const uint8_t raw_r2 = trigger(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
+        update_menu_mode(g, k, raw_l2, raw_r2);
+        for (size_t i = 0; i < CONTROLLER_BUTTON_COUNT; ++i) {
+            if (SDL_GetGamepadButton(g, controller_button_map[i].sdl))
+                d->buttons |= menu_mode ? controller_button_map[i].ps_menu : controller_button_map[i].ps;
+        }
+        d->left_x=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFTX)); d->left_y=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFTY));
+        d->right_x=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHTX)); d->right_y=axis(SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHTY));
+        const uint32_t lt_action = menu_mode ? left_trigger_menu : left_trigger_action;
+        const uint32_t rt_action = menu_mode ? right_trigger_menu : right_trigger_action;
+        d->l2 = lt_action == BTN_L2 ? raw_l2 : 0;
+        d->r2 = rt_action == BTN_R2 ? raw_r2 : 0;
+        if (raw_l2 > 30) d->buttons |= lt_action;
+        if (raw_r2 > 30) d->buttons |= rt_action;
+        if (SDL_GetNumGamepadTouchpads(g)>0) {
+            const int fingers=SDL_GetNumGamepadTouchpadFingers(g,0);
+            for (int finger=0;finger<fingers && d->touch_count<2;++finger) {
+                bool down=false;
+                float x=0, y=0;
+                if (SDL_GetGamepadTouchpadFinger(g,0,finger,&down,&x,&y,NULL) && down) {
+                    d->touches[d->touch_count++]=(PadTouch){.x=touch_axis(x,1919),
+                        .y=touch_axis(y,942),.id=(uint8_t)finger};
+                }
+            }
+        }
+        // Back/Select on pads without a touch surface is a left-side click.
+        if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
+        if (k && k[SDL_SCANCODE_TAB]) touch_click(d,0);
+        if (k && k[SDL_SCANCODE_BACKSPACE]) touch_click(d,1);
+        return;
+    }
+    if (!k) return;
+    static const struct { SDL_Scancode key; uint32_t ps; } keys[]={
+        {SDL_SCANCODE_SPACE,BTN_CROSS}, {SDL_SCANCODE_LSHIFT,BTN_CIRCLE}, {SDL_SCANCODE_E,BTN_SQUARE},
+        {SDL_SCANCODE_Q,BTN_TRIANGLE}, {SDL_SCANCODE_1,BTN_L1}, {SDL_SCANCODE_3,BTN_R1},
+        {SDL_SCANCODE_R,BTN_L2}, {SDL_SCANCODE_F,BTN_R2}, {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
+        {SDL_SCANCODE_RETURN,BTN_OPTIONS},
+        {SDL_SCANCODE_I,BTN_UP}, {SDL_SCANCODE_K,BTN_DOWN}, {SDL_SCANCODE_J,BTN_LEFT}, {SDL_SCANCODE_L,BTN_RIGHT},
+    };
+    for (size_t i=0;i<sizeof(keys)/sizeof(*keys);++i) if (k[keys[i].key]) d->buttons|=keys[i].ps;
+    if (k[SDL_SCANCODE_TAB]) touch_click(d,0);
+    if (k[SDL_SCANCODE_BACKSPACE]) touch_click(d,1);
+    if (d->buttons & BTN_L2) d->l2=255;
+    if (d->buttons & BTN_R2) d->r2=255;
+    d->left_x=(uint8_t)(128-(k[SDL_SCANCODE_A] ? 128 : 0)+(k[SDL_SCANCODE_D] ? 127 : 0));
+    d->left_y=(uint8_t)(128-(k[SDL_SCANCODE_W] ? 128 : 0)+(k[SDL_SCANCODE_S] ? 127 : 0));
+    d->right_x=(uint8_t)(128-(k[SDL_SCANCODE_LEFT] ? 128 : 0)+(k[SDL_SCANCODE_RIGHT] ? 127 : 0));
+    d->right_y=(uint8_t)(128-(k[SDL_SCANCODE_UP] ? 128 : 0)+(k[SDL_SCANCODE_DOWN] ? 127 : 0));
+}
+
+/* BB_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated
+ * tokens, re-read when it changes: button names (cross circle square triangle l1 r1 l2 r2 l3 r3
+ * options touchpad touchpad_left touchpad_right up down left right) are held while listed;
+ * touchpad defaults to a left-side click; lx= ly= rx= ry= (0..255) override
+ * the sticks. An empty file releases everything. */
+static struct { uint32_t buttons; int stick[4]; int touch_side; } injected={0,{-1,-1,-1,-1},-1};
+static int replay_armed;      /* 1 while a BB_PAD_REPLAY recording plays, 2 once it ended */
+static uint64_t replay_start; /* 0: (re)start at the next sample */
+static void read_inject(void) {
+    static const char *path; static int checked; static uint64_t last_check; static struct timespec mtime;
+    if (!checked) { path=getenv("BB_PAD_FILE"); checked=1; }
+    if (!path || !*path) return;
+    uint64_t now=now_us();
+    if (now-last_check<20000) return;
+    last_check=now;
+    struct stat st;
+    if (stat(path,&st)!=0) return;
+#ifdef _WIN32
+    /* Whole-second mtimes: the size tells two edits within a second apart. */
+    if (st.st_mtime==mtime.tv_sec && st.st_size==mtime.tv_nsec) return;
+    mtime=(struct timespec){st.st_mtime,(long)st.st_size};
+#else
+    if (st.st_mtim.tv_sec==mtime.tv_sec && st.st_mtim.tv_nsec==mtime.tv_nsec) return;
+    mtime=st.st_mtim;
+#endif
+    FILE *f=fopen(path,"r");
+    if (!f) return;
+    static const struct { const char *name; uint32_t ps; } names[]={
+        {"cross",BTN_CROSS}, {"circle",BTN_CIRCLE}, {"square",BTN_SQUARE}, {"triangle",BTN_TRIANGLE},
+        {"l1",BTN_L1}, {"r1",BTN_R1}, {"l2",BTN_L2}, {"r2",BTN_R2}, {"l3",BTN_L3}, {"r3",BTN_R3},
+        {"options",BTN_OPTIONS}, {"touchpad",BTN_TOUCHPAD},
+        {"up",BTN_UP}, {"down",BTN_DOWN}, {"left",BTN_LEFT}, {"right",BTN_RIGHT},
+    };
+    static const char *sticks[]={"lx=","ly=","rx=","ry="};
+    injected.buttons=0;
+    injected.touch_side=-1;
+    for (int i=0;i<4;++i) injected.stick[i]=-1;
+    char token[64];
+    while (fscanf(f,"%63s",token)==1) {
+        if (!strcmp(token,"replay") && replay_armed!=1) { replay_armed=1; replay_start=0; } /* BB_PAD_REPLAY */
+        if (!strcmp(token,"touchpad_left") || !strcmp(token,"touchpad_right")) {
+            injected.buttons|=BTN_TOUCHPAD;
+            injected.touch_side=!strcmp(token,"touchpad_right");
+        }
+        for (size_t i=0;i<sizeof(names)/sizeof(*names);++i) if (!strcmp(token,names[i].name)) injected.buttons|=names[i].ps;
+        for (int i=0;i<4;++i) if (!strncmp(token,sticks[i],3)) { int v=atoi(token+3); injected.stick[i]=v<0 ? 0 : v>255 ? 255 : v; }
+    }
+    fclose(f);
+    printf("Runtime: pad file: buttons 0x%x sticks %d %d %d %d\n",injected.buttons,
+           injected.stick[0],injected.stick[1],injected.stick[2],injected.stick[3]);
+}
+/* BB_PAD_RECORD=<file>: F9 starts and stops recording the pad state (gamepad or keyboard) with
+ * the time since F9; BB_PAD_REPLAY=<file> plays such a recording back, started by the token
+ * "replay" in BB_PAD_FILE (scripted tests repeat a route the player ran once). Lines: ms buttons
+ * lx ly rx ry l2 r2, written when the state changes. */
+typedef struct { uint32_t ms, buttons; uint8_t axes[4], l2, r2; } PadSample;
+static FILE *record_file;
+static uint64_t record_start;
+static PadSample record_last;
+static void record_sample(const PadData *d) {
+    static const char *path; static int checked, f9_was_down;
+    if (!checked) { path=getenv("BB_PAD_RECORD"); checked=1; }
+    if (!path || !*path || !sdl_ready) return;
+    const bool *k=SDL_GetKeyboardState(NULL);
+    const int f9=k && k[SDL_SCANCODE_F9];
+    if (f9 && !f9_was_down) {
+        if (record_file) {
+            fclose(record_file); record_file=NULL;
+            printf("Runtime: pad recording stopped (%s)\n",path);
+        } else if ((record_file=fopen(path,"w"))) {
+            record_start=now_us();
+            memset(&record_last,0xff,sizeof(record_last));
+            printf("Runtime: pad recording started (%s, F9 stops)\n",path);
+        }
+    }
+    f9_was_down=f9;
+    if (!record_file) return;
+    PadSample s={(uint32_t)((now_us()-record_start)/1000),d->buttons,
+                 {d->left_x,d->left_y,d->right_x,d->right_y},d->l2,d->r2};
+    if (s.buttons==record_last.buttons && !memcmp(s.axes,record_last.axes,4) &&
+        s.l2==record_last.l2 && s.r2==record_last.r2) return;
+    record_last=s;
+    fprintf(record_file,"%u %u %u %u %u %u %u %u\n",s.ms,s.buttons,s.axes[0],s.axes[1],s.axes[2],
+            s.axes[3],s.l2,s.r2);
+    fflush(record_file);
+}
+static PadSample *replay; static size_t replay_count, replay_next;
+static void replay_sample(PadData *d) {
+    if (!replay_armed) return;
+    if (!replay_start) {
+        static int loaded;
+        if (!loaded) {
+            loaded=1;
+            const char *path=getenv("BB_PAD_REPLAY");
+            FILE *f=path ? fopen(path,"r") : NULL;
+            PadSample s; unsigned v[8]; size_t cap=0;
+            while (f && fscanf(f,"%u %u %u %u %u %u %u %u",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5],&v[6],&v[7])==8) {
+                s=(PadSample){v[0],v[1],{(uint8_t)v[2],(uint8_t)v[3],(uint8_t)v[4],(uint8_t)v[5]},(uint8_t)v[6],(uint8_t)v[7]};
+                if (replay_count==cap && !(replay=realloc(replay,(cap=cap ? cap*2 : 1024)*sizeof(*replay)))) break;
+                replay[replay_count++]=s;
+            }
+            if (f) fclose(f);
+            printf("Runtime: pad replay of %zu samples from %s\n",replay_count,path ? path : "(unset)");
+        }
+        replay_start=now_us();
+        replay_next=0;
+    }
+    const uint32_t ms=(uint32_t)((now_us()-replay_start)/1000);
+    while (replay_next<replay_count && replay[replay_next].ms<=ms) ++replay_next;
+    if (!replay_next) return;
+    if (replay_next==replay_count && ms>replay[replay_count-1].ms+500) {
+        if (replay_armed==1) { puts("Runtime: pad replay finished"); replay_armed=2; }
+        return;
+    }
+    const PadSample *s=&replay[replay_next-1];
+    d->buttons=s->buttons;
+    d->left_x=s->axes[0]; d->left_y=s->axes[1]; d->right_x=s->axes[2]; d->right_y=s->axes[3];
+    d->l2=s->l2; d->r2=s->r2;
+}
+/* After the menu or the text dialog closes, buttons still held (the Cross that accepted a
+ * name) stay hidden until released: the game would take them as a new press. */
+static int hold_after_capture;
+static void sample(PadData *d) {
+    sample_host(d);
+    if (bbgpu_overlay_captures_input()) { hold_after_capture=1; return; }
+    record_sample(d);
+    read_inject();
+    replay_sample(d);
+    d->buttons|=injected.buttons;
+    if (injected.touch_side>=0) touch_click(d,injected.touch_side);
+    else if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
+    if (injected.buttons & BTN_L2) d->l2=255;
+    if (injected.buttons & BTN_R2) d->r2=255;
+    uint8_t *axes[4]={&d->left_x,&d->left_y,&d->right_x,&d->right_y};
+    for (int i=0;i<4;++i) if (injected.stick[i]>=0) *axes[i]=(uint8_t)injected.stick[i];
+    if (hold_after_capture) {
+        if (d->buttons) d->buttons=0;
+        else hold_after_capture=0;
+    }
+}
+
+static ABI int32_t pad_init(void) { pthread_mutex_lock(&lock); initialized=1; pthread_mutex_unlock(&lock); return 0; }
+static ABI int32_t pad_open(int32_t user, int32_t type, int32_t index, const void *param) {
+    (void)param;
+    if (!initialized) return ERR_NOT_INITIALIZED;
+    if (user!=1) return ERR_INVALID_ARG;
+    if (type!=0 && type!=2) return ERR_INVALID_ARG; /* standard / special port */
+    if (index) return ERR_INVALID_ARG;
+    pthread_mutex_lock(&lock);
+    int already=opened; opened=1;
+    pthread_mutex_unlock(&lock);
+    if (already) return ERR_ALREADY_OPENED;
+    puts("Runtime: pad opened for user 1 (SDL gamepad or keyboard)");
+    return PAD_HANDLE;
+}
+static ABI int32_t pad_close(int32_t handle) {
+    if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    opened=0; return 0;
+}
+static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
+    if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    if (!data) return ERR_INVALID_ARG;
+    pthread_mutex_lock(&lock);
+    sample(data); ++reads;
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+/* Buffered read: the port samples once per call, so one entry is returned. */
+static ABI int32_t pad_read(int32_t handle, PadData *data, int32_t count) {
+    if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    if (!data || count<1 || count>64) return ERR_INVALID_ARG;
+    pad_read_state(handle,data);
+    return 1;
+}
+static ABI int32_t pad_info(int32_t handle, ControllerInfo *info) {
+    if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    if (!info) return ERR_INVALID_ARG;
+    memset(info,0,sizeof(*info));
+    info->pixel_density=44.86f; info->resolution_x=1920; info->resolution_y=943;
+    info->dead_zone_left=info->dead_zone_right=2;
+    info->connection_type=0; info->connected=1; info->device_class=0;
+    pthread_mutex_lock(&lock);
+    current_gamepad();
+    info->connected_count=connected_count ? connected_count : 1;
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
+    if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    if (!param) return ERR_INVALID_ARG;
+    pthread_mutex_lock(&lock);
+    SDL_Gamepad *g=current_gamepad();
+    if (g) SDL_RumbleGamepad(g,(uint16_t)(param[0]*257),(uint16_t)(param[1]*257),1000);
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+static ABI int32_t pad_ok_handle(int32_t handle) { return handle==PAD_HANDLE && opened ? 0 : ERR_INVALID_HANDLE; }
+static ABI int32_t pad_ok_handle_flag(int32_t handle, uint8_t flag) { (void)flag; return pad_ok_handle(handle); }
+
+static const RuntimeExport exports[]={
+    {"scePadInit",pad_init}, {"scePadOpen",pad_open}, {"scePadClose",pad_close},
+    {"scePadReadState",pad_read_state}, {"scePadRead",pad_read},
+    {"scePadGetControllerInformation",pad_info}, {"scePadSetVibration",pad_vibration},
+    {"scePadResetOrientation",pad_ok_handle},
+    {"scePadSetAngularVelocityDeadbandState",pad_ok_handle_flag}, {"scePadSetTiltCorrectionState",pad_ok_handle_flag},
+    {"scePadSetMotionSensorState",pad_ok_handle_flag},
+};
+uintptr_t runtime_pad_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
+void runtime_pad_report(void) { printf("Runtime: pad reads=%zu, gamepad=%s\n",reads,gamepad ? SDL_GetGamepadName(gamepad) : "none"); }
