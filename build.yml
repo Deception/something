@@ -1,15 +1,15 @@
 name: Build bb-probe.exe
- 
+
 on:
   workflow_dispatch:
- 
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - name: Get this repo (modified source files)
         uses: actions/checkout@v4
- 
+
       - name: Set up MSYS2 CLANG64
         uses: msys2/setup-msys2@v2
         with:
@@ -17,20 +17,7 @@ jobs:
           update: true
           install: >-
             git make unzip zip python
- 
-      - name: Install build packages (one by one, reports any not found)
-        shell: msys2 {0}
-        run: |
-          missing=""
-          for pkg in clang cmake ninja pkgconf sdl3 vulkan-headers vulkan-loader \
-                     openssl protobuf abseil-cpp ffmpeg zlib zstd nlohmann-json \
-                     miniupnpc cpp-httplib zydis libwinpthread; do
-            if ! pacman -S --needed --noconfirm "mingw-w64-clang-x86_64-$pkg"; then
-              missing="$missing $pkg"
-            fi
-          done
-          echo "PACKAGES NOT FOUND:${missing:- none}"
- 
+
       - name: Fetch upstream source (windows-v1.6)
         shell: msys2 {0}
         run: |
@@ -40,29 +27,54 @@ jobs:
           git submodule update --init --recursive
           echo "---- upstream packaging notes ----"
           cat packaging/windows/README.md || true
- 
+
+      - name: Install build packages (upstream's list + extras, reports any not found)
+        shell: msys2 {0}
+        run: |
+          P=mingw-w64-clang-x86_64
+          # Packages named in upstream's own Windows setup guide.
+          from_readme=$( { grep -ohE "mingw-w64-clang-x86_64-[A-Za-z0-9_.+-]+" upstream/packaging/windows/README.md 2>/dev/null; \
+                           grep -ohE '\$MINGW_PACKAGE_PREFIX-[A-Za-z0-9_.+-]+' upstream/packaging/windows/README.md 2>/dev/null | sed "s|\\\$MINGW_PACKAGE_PREFIX|$P|"; } | sort -u )
+          echo "From upstream README: $from_readme"
+          extras=""
+          for pkg in clang cmake ninja pkgconf sdl3 vulkan-headers vulkan-loader openssl protobuf \
+                     abseil-cpp ffmpeg zlib zstd nlohmann-json miniupnpc cpp-httplib zydis libwinpthread \
+                     fmt xxhash libpng boost glslang spirv-headers spirv-tools vulkan-memory-allocator \
+                     magic_enum robin-map toml11 libpng lz4 libsamplerate; do
+            extras="$extras $P-$pkg"
+          done
+          missing=""
+          for pkg in $from_readme $extras; do
+            if ! pacman -S --needed --noconfirm "$pkg"; then missing="$missing $pkg"; fi
+          done
+          echo "PACKAGES NOT FOUND:${missing:- none}"
+
       - name: Apply modified files
         shell: msys2 {0}
         run: |
-          cp mod_source/runtime_pad.c upstream/src/runtime_pad.c
-          cp mod_source/runtime_services.c upstream/src/runtime_services.c
-          cp mod_source/build.sh upstream/build.sh
- 
+          echo "Files in repo:"; find . -path ./upstream -prune -o -type f -not -path './.git/*' -print
+          for f in runtime_pad.c runtime_services.c build.sh; do
+            src=$(find . -path ./upstream -prune -o -type f -name "$f" -not -path './.git/*' -print | head -n 1)
+            if [ -z "$src" ]; then echo "ERROR: $f was not uploaded to the repo"; exit 1; fi
+            case "$f" in build.sh) dest=upstream/build.sh;; *) dest=upstream/src/$f;; esac
+            echo "Using $src -> $dest"
+            cp "$src" "$dest"
+          done
+
       - name: Build
         shell: msys2 {0}
         run: |
           cd upstream
           bash build.sh
- 
+
       - name: Collect output
         shell: msys2 {0}
         run: |
           mkdir dist
           cp upstream/out/bb-probe.exe dist/
           ldd upstream/out/bb-probe.exe | grep -i clang64 | awk '{print $3}' | xargs -r cp -n -t dist/ || true
- 
+
       - uses: actions/upload-artifact@v4
         with:
           name: bb-probe
           path: dist/
- 
